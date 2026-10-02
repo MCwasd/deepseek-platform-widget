@@ -39,10 +39,14 @@ class DeepSeekApiClient(
         private const val COST_URL = "$PLATFORM_BASE/api/v0/usage/by_api_key/cost"
         private const val TIMEOUT_SECONDS = 15L
 
-        // 2026-08 新上线多模态模型（价格与 Flash 一致）
-        private const val MODEL_FLASH = "deepseek-v4-flash"
-        private const val MODEL_VISION = "deepseek-v4-flash-vision-exp"
-        private const val MODEL_PRO = "deepseek-v4-pro"
+        // 模型名归一化（2026-10）：V4.1 起平台把旧模型名合并
+        //   deepseek-v4-flash / deepseek-v4-flash-vision-exp / deepseek-chat ... → deepseek-flash
+        // 因此不再按“完整旧名”精确匹配，改为按关键字归一到展示桶；
+        // 未识别的名称进 OTHER 桶（只计入今日/本月总额，避免漏账）。
+        private const val BUCKET_FLASH = "flash"
+        private const val BUCKET_VISION = "vision"
+        private const val BUCKET_PRO = "pro"
+        private const val BUCKET_OTHER = "other"
     }
 
     private val gson = Gson()
@@ -152,6 +156,17 @@ class DeepSeekApiClient(
         val pro: ModelData = ModelData()
     )
 
+    /** 把平台返回的模型名归一到展示桶，兼容 V4.1 的模型名合并与后续任何改名。 */
+    private fun bucketOf(model: String?): String {
+        val m = model?.lowercase() ?: return BUCKET_OTHER
+        return when {
+            m.contains("pro") -> BUCKET_PRO
+            m.contains("vision") -> BUCKET_VISION
+            m.contains("flash") || m.contains("chat") || m.contains("reason") -> BUCKET_FLASH
+            else -> BUCKET_OTHER
+        }
+    }
+
     private fun fetchMonthUsage(): MonthUsageResult {
         val now = Calendar.getInstance(usageTimeZone)
         val year = now.get(Calendar.YEAR)
@@ -186,16 +201,16 @@ class DeepSeekApiClient(
             val series = biz.series ?: emptyList()
             amountSeriesCount = series.size
             for (s in series) {
-                val model = s.model ?: continue
+                val bucket = bucketOf(s.model)
                 for (b in s.buckets ?: emptyList()) {
                     val t = b.time ?: continue
                     val u = b.usage ?: continue
                     if (t >= monthStart && t < monthEnd) {
-                        val bd = monthTokensByModel.getOrPut(model) { TokenBreakdown() }
-                        monthTokensByModel[model] = bd.add(u)
+                        val bd = monthTokensByModel.getOrPut(bucket) { TokenBreakdown() }
+                        monthTokensByModel[bucket] = bd.add(u)
                         if (t >= todayStart && t < todayEnd) {
-                            val td = todayTokensByModel.getOrPut(model) { TokenBreakdown() }
-                            todayTokensByModel[model] = td.add(u)
+                            val td = todayTokensByModel.getOrPut(bucket) { TokenBreakdown() }
+                            todayTokensByModel[bucket] = td.add(u)
                         }
                     }
                 }
@@ -217,14 +232,14 @@ class DeepSeekApiClient(
             val entry = biz.data?.firstOrNull()
             costSeriesCount = entry?.series?.size ?: 0
             for (s in entry?.series ?: emptyList()) {
-                val model = s.model ?: continue
+                val bucket = bucketOf(s.model)
                 for (b in s.buckets ?: emptyList()) {
                     val t = b.time ?: continue
                     val cost = b.cost?.toDoubleOrNull() ?: 0.0
                     if (t >= monthStart && t < monthEnd) {
-                        monthCostByModel[model] = (monthCostByModel[model] ?: 0.0) + cost
+                        monthCostByModel[bucket] = (monthCostByModel[bucket] ?: 0.0) + cost
                         if (t >= todayStart && t < todayEnd) {
-                            todayCostByModel[model] = (todayCostByModel[model] ?: 0.0) + cost
+                            todayCostByModel[bucket] = (todayCostByModel[bucket] ?: 0.0) + cost
                         }
                     }
                 }
@@ -245,43 +260,50 @@ class DeepSeekApiClient(
         val monthTokensAll = monthTokensByModel.values.sumOf { it.totalTokens }
         val monthCostAll = monthCostByModel.values.sum()
 
-        val flashToday = todayTokensByModel[MODEL_FLASH] ?: TokenBreakdown()
-        val visionToday = todayTokensByModel[MODEL_VISION] ?: TokenBreakdown()
-        val proToday = todayTokensByModel[MODEL_PRO] ?: TokenBreakdown()
-        val flashMonthTk = monthTokensByModel[MODEL_FLASH]?.totalTokens ?: 0L
-        val visionMonthTk = monthTokensByModel[MODEL_VISION]?.totalTokens ?: 0L
-        val proMonthTk = monthTokensByModel[MODEL_PRO]?.totalTokens ?: 0L
+        val flashToday = todayTokensByModel[BUCKET_FLASH] ?: TokenBreakdown()
+        val visionToday = todayTokensByModel[BUCKET_VISION] ?: TokenBreakdown()
+        val proToday = todayTokensByModel[BUCKET_PRO] ?: TokenBreakdown()
+        val flashMonthTk = monthTokensByModel[BUCKET_FLASH]?.totalTokens ?: 0L
+        val visionMonthTk = monthTokensByModel[BUCKET_VISION]?.totalTokens ?: 0L
+        val proMonthTk = monthTokensByModel[BUCKET_PRO]?.totalTokens ?: 0L
 
-        val todayCostTotal = (todayCostByModel[MODEL_FLASH] ?: 0.0) +
-            (todayCostByModel[MODEL_VISION] ?: 0.0) +
-            (todayCostByModel[MODEL_PRO] ?: 0.0)
+        // 今日总额：对全部模型（含 OTHER）求和，不再只认三个旧模型名
+        val todayCostTotal = todayCostByModel.values.sum()
 
         // Flash / Flash Vision Exp / Pro 卡片仍显示“今日”数据（与旧版行为一致）
+        val flashModel = ModelData(
+            totalTokens = flashToday.totalTokens,
+            cacheHitRate = flashToday.cacheHitRate,
+            cost = "%.2f".format(todayCostByModel[BUCKET_FLASH] ?: 0.0),
+            requests = flashToday.requests,
+            monthlyTokens = flashMonthTk
+        )
+        // V4.1 起 vision 已并入 flash（平台不再返回 vision 专名）；
+        // 若本月/今日完全没有 vision 记录，则 Vision 卡片回显 Flash 数据，而不是显示 0。
+        val visionHasData = todayTokensByModel.containsKey(BUCKET_VISION) ||
+            monthTokensByModel.containsKey(BUCKET_VISION)
+        val visionModel = if (visionHasData) ModelData(
+            totalTokens = visionToday.totalTokens,
+            cacheHitRate = visionToday.cacheHitRate,
+            cost = "%.2f".format(todayCostByModel[BUCKET_VISION] ?: 0.0),
+            requests = visionToday.requests,
+            monthlyTokens = visionMonthTk
+        ) else flashModel.copy()
+        val proModel = ModelData(
+            totalTokens = proToday.totalTokens,
+            cacheHitRate = proToday.cacheHitRate,
+            cost = "%.2f".format(todayCostByModel[BUCKET_PRO] ?: 0.0),
+            requests = proToday.requests,
+            monthlyTokens = proMonthTk
+        )
+
         return MonthUsageResult(
             todayCostTotal = "%.2f".format(todayCostTotal),
             monthCostTotal = "%.2f".format(monthCostAll),
             monthTokens = monthTokensAll,
-            flash = ModelData(
-                totalTokens = flashToday.totalTokens,
-                cacheHitRate = flashToday.cacheHitRate,
-                cost = "%.2f".format(todayCostByModel[MODEL_FLASH] ?: 0.0),
-                requests = flashToday.requests,
-                monthlyTokens = flashMonthTk
-            ),
-            vision = ModelData(
-                totalTokens = visionToday.totalTokens,
-                cacheHitRate = visionToday.cacheHitRate,
-                cost = "%.2f".format(todayCostByModel[MODEL_VISION] ?: 0.0),
-                requests = visionToday.requests,
-                monthlyTokens = visionMonthTk
-            ),
-            pro = ModelData(
-                totalTokens = proToday.totalTokens,
-                cacheHitRate = proToday.cacheHitRate,
-                cost = "%.2f".format(todayCostByModel[MODEL_PRO] ?: 0.0),
-                requests = proToday.requests,
-                monthlyTokens = proMonthTk
-            )
+            flash = flashModel,
+            vision = visionModel,
+            pro = proModel
         )
     }
 
