@@ -10,6 +10,9 @@ import java.util.Calendar
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 
+/** 宽容解析平台返回的数值字段：可能是 "123"、"123.0"，也兼容 JSON number 被字符串化的情况。 */
+private fun String?.toLongLoose(): Long = this?.toDoubleOrNull()?.toLong() ?: 0L
+
 /**
  * DeepSeek open-platform API client.
  *
@@ -132,17 +135,17 @@ class DeepSeekApiClient(
         }
 
         fun add(u: UsageByKeyUsage): TokenBreakdown {
-            val hit = u.cacheHitToken?.toLongOrNull() ?: 0L
-            val miss = u.cacheMissToken?.toLongOrNull() ?: 0L
-            val prompt = u.promptToken?.toLongOrNull() ?: 0L
+            val hit = u.cacheHitToken.toLongLoose()
+            val miss = u.cacheMissToken.toLongLoose()
+            val prompt = u.promptToken.toLongLoose()
             // 新端点输入 = HIT + MISS；若返回 PROMPT_TOKEN 但无细分，则用其作输入
             val input = if (hit + miss > 0) hit + miss else prompt
             return TokenBreakdown(
                 inputTokens = this.inputTokens + input,
-                outputTokens = this.outputTokens + (u.responseToken?.toLongOrNull() ?: 0L),
+                outputTokens = this.outputTokens + u.responseToken.toLongLoose(),
                 cacheHitTokens = this.cacheHitTokens + hit,
                 cacheMissTokens = this.cacheMissTokens + miss,
-                requests = this.requests + (u.request?.toLongOrNull() ?: 0L)
+                requests = this.requests + u.request.toLongLoose()
             )
         }
     }
@@ -229,7 +232,14 @@ class DeepSeekApiClient(
             val data = resp.data ?: throw Exception("data 为空: ${body.take(200)}")
             if (data.bizCode != 0) throw Exception("biz_code=${data.bizCode} ${data.bizMsg}")
             val biz = data.bizData ?: throw Exception("biz_data 为空: ${body.take(200)}")
-            val entry = biz.data?.firstOrNull()
+            // 平台可能返回多个币种分组（CNY/USD）；优先选“有实际花费”的一组，避免取到空组导致费用全 0
+            val blocks = biz.data ?: emptyList()
+            fun spendOf(blk: UsageCostCurrency): Double = (blk.series ?: emptyList()).sumOf { s ->
+                (s.buckets ?: emptyList()).sumOf { b -> b.cost?.toDoubleOrNull() ?: 0.0 }
+            }
+            val entry = blocks.firstOrNull { it.currency == "CNY" && spendOf(it) > 0.0 }
+                ?: blocks.firstOrNull { spendOf(it) > 0.0 }
+                ?: blocks.firstOrNull()
             costSeriesCount = entry?.series?.size ?: 0
             for (s in entry?.series ?: emptyList()) {
                 val bucket = bucketOf(s.model)
@@ -307,6 +317,48 @@ class DeepSeekApiClient(
         )
     }
 
+    // ─── 诊断（问题反馈用）───────────────────────────────────
+
+    /** 抓取原始响应片段 + 关键参数，供反馈问题时复制排查。 */
+    fun fetchDiagnostics(): String {
+        val sb = StringBuilder()
+        val nowMs = System.currentTimeMillis()
+        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+        sb.append("DeepSeekWidget v1.2.2 diag\n")
+        sb.append("tz=").append(usageTimeZone.id)
+            .append(" offsetSec=").append(usageTimeZone.getOffset(nowMs) / 1000)
+            .append(" now=").append(fmt.format(java.util.Date(nowMs))).append('\n')
+        val now = Calendar.getInstance(usageTimeZone)
+        val y = now.get(Calendar.YEAR)
+        val m = now.get(Calendar.MONTH) + 1
+        val d = now.get(Calendar.DAY_OF_MONTH)
+        val tz = usageTimeZone.getOffset(nowMs) / 1000
+        val monthStart = midnightEpochSec(y, m, 1)
+        val monthEnd = rollMonthEnd(y, m)
+        sb.append("month=[").append(monthStart).append(',').append(monthEnd).append(") ")
+            .append("today=[").append(midnightEpochSec(y, m, d)).append(',')
+            .append(rollDayEnd(y, m, d)).append(")\n")
+        for ((name, url) in listOf(
+            "amount" to "$AMOUNT_URL?start=$monthStart&end=$monthEnd&tz=$tz",
+            "cost" to "$COST_URL?start=$monthStart&end=$monthEnd&tz=$tz"
+        )) {
+            sb.append("── ").append(name).append(" ──\n")
+            try {
+                sb.append(execute(url).take(1800))
+            } catch (e: Exception) {
+                sb.append("ERR: ").append(e.message)
+            }
+            sb.append('\n')
+        }
+        sb.append("── summary ──\n")
+        try {
+            sb.append(execute(SUMMARY_URL).take(600))
+        } catch (e: Exception) {
+            sb.append("ERR: ").append(e.message)
+        }
+        return sb.toString()
+    }
+
     // ─── 时间计算（基于用量时区）────────────────────────────────
 
     /** Local midnight (00:00 in usageTimeZone) as epoch seconds. */
@@ -340,13 +392,18 @@ class DeepSeekApiClient(
     private fun execute(url: String): String {
         val request = buildRequest(url)
         val response = client.newCall(request).execute()
+        val body = response.body?.string() ?: ""
         if (!response.isSuccessful) {
-            throw when (response.code) {
-                401 -> Exception("登录已过期，请重新登录")
-                else -> Exception("API ${response.code}: ${response.body?.string() ?: ""}")
+            throw when {
+                response.code == 401 -> Exception("登录已过期，请重新登录")
+                response.code == 429 || body.trimStart().startsWith("<") ->
+                    Exception("被平台拦截（HTTP ${response.code}），请稍后重试")
+                else -> Exception("API ${response.code}: ${body.take(160)}")
             }
         }
-        return response.body?.string() ?: throw Exception("空响应")
+        // WAF 拦截页可能以 200 返回 HTML
+        if (body.trimStart().startsWith("<")) throw Exception("被平台拦截（非 JSON 响应），请稍后重试")
+        return body
     }
 }
 

@@ -130,6 +130,16 @@
 
         </LinearLayout>
 
+        <!-- 诊断（问题反馈用） -->
+        <Button
+            android:id="@+id/btn_diag"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:text="获取诊断信息（复制）"
+            android:textSize="12sp"
+            android:layout_marginTop="12dp"
+            style="?android:attr/buttonStyle" />
+
         <!-- Description -->
         <TextView
             android:layout_width="match_parent"

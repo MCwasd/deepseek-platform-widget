@@ -2,6 +2,7 @@ package com.tiramisu.deepseekwidget
 
 import android.app.Activity
 import android.appwidget.AppWidgetManager
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.view.View
@@ -51,6 +52,7 @@ class DeepSeekWidgetConfig : Activity() {
         val spTz = findViewById<Spinner>(R.id.sp_tz)
         val btnLogin = findViewById<Button>(R.id.btn_login)
         val btnCancel = findViewById<Button>(R.id.btn_cancel)
+        val btnDiag = findViewById<Button>(R.id.btn_diag)
         val tvStatus = findViewById<TextView>(R.id.tv_config_status)
 
         // Pre-fill if already configured (re-configuring)
@@ -107,6 +109,31 @@ class DeepSeekWidgetConfig : Activity() {
 
         btnCancel.setOnClickListener {
             finish()
+        }
+
+        // 诊断：抓取“最近一次刷新”同口径的原始响应，复制到剪贴板，用于问题反馈
+        btnDiag.setOnClickListener {
+            val token = accountManager.getValidToken()
+            if (token.isNullOrBlank()) {
+                Toast.makeText(this, "请先登录成功后再获取诊断", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            tvStatus.visibility = View.VISIBLE
+            tvStatus.text = "正在获取诊断信息..."
+            btnDiag.isEnabled = false
+            Thread {
+                val text = try {
+                    DeepSeekApiClient(token, DeepSeekWidget.getUsageTimeZone(this)).fetchDiagnostics()
+                } catch (e: Exception) {
+                    "诊断获取失败: ${e.message}"
+                }
+                runOnUiThread {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("dsdiag", text))
+                    tvStatus.text = "✅ 诊断信息已复制到剪贴板，请发送给开发者"
+                    btnDiag.isEnabled = true
+                }
+            }.start()
         }
     }
 

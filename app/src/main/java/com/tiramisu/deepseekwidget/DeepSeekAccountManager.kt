@@ -160,13 +160,13 @@ class DeepSeekAccountManager(context: Context) {
      * Returns null only when no credentials are available at all.
      */
     fun getValidToken(): String? {
-        val token = loadToken()
-        if (token != null) return token
-
-        val email = loadEmail() ?: return null
-        val password = loadPassword() ?: return null
-
         return try {
+            val token = loadToken()
+            if (token != null) return token
+
+            val email = loadEmail() ?: return null
+            val password = loadPassword() ?: return null
+
             login(email, password)
         } catch (_: Exception) {
             null

@@ -56,7 +56,7 @@ class DeepSeekWidget : AppWidgetProvider() {
             2 -> java.util.TimeZone.getTimeZone("UTC")
             else -> java.util.TimeZone.getDefault()
         }
-        fun getTokenFromAccount(c:Context):String?=DeepSeekAccountManager(c).getValidToken()
+        fun getTokenFromAccount(c:Context):String? = try { DeepSeekAccountManager(c).getValidToken() } catch (_:Exception){ null }
         fun getAuthToken(c:Context):String?=getTokenFromAccount(c)?:getApiKey(c)
         private fun refreshPi(c:Context)=PendingIntent.getBroadcast(c,0,Intent(c,DeepSeekWidget::class.java).apply{action=ACTION_REFRESH},PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         private fun modelPi(c:Context)=PendingIntent.getBroadcast(c,1,Intent(c,DeepSeekWidget::class.java).apply{action=ACTION_MODEL_TOGGLE},PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
