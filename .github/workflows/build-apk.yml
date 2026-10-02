@@ -21,6 +21,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # 'tools' package was removed from Google's SDK repo (2026-10) — only install
+          # platform-tools; the runner image already provides cmdline-tools/build-tools/platforms.
+          packages: "platform-tools"
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
